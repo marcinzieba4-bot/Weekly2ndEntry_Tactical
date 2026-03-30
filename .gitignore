@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+top50.csv
+signals.csv
+*.egg-info/
+.venv/
