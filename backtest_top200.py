@@ -12,6 +12,10 @@ year-start close × current shares outstanding), detect weekly MACD (12,26,9)
                → re-enter at that close, new stop = low of re-entry candle,
                  new 8-week clock; skipped if a new MACD signal fires first
 
+Filters applied:
+  SPY filter : SPY weekly MACD histogram must be > 0 on signal date
+  Cap filter : max 20 concurrent open trades (FIFO — first-come first-served)
+
 Data fetched via AWS Lambda (yfinance inside Lambda has unrestricted internet).
 Results saved to trades_top200.csv.
 
@@ -30,8 +34,10 @@ FUNC_NAME     = 'yfinance-data-fetcher'
 BATCH_SIZE    = 15          # tickers per Lambda invocation
 MAX_WORKERS   = 20          # parallel Lambda invocations
 TOP_N         = 200         # universe size per year
+MAX_CONCURRENT = 20         # max open trades at any time
 UNIVERSE_FILE = '/tmp/sp500_universe.json'
 DATA_CACHE    = '/tmp/ohlcv_cache.json'
+SPY_CACHE     = '/tmp/spy_cache.json'
 OUTPUT_CSV    = 'trades_top200.csv'
 
 from botocore.config import Config as BotoConfig
@@ -226,56 +232,124 @@ def build_yearly_universes(all_data, shares_map):
     return universe
 
 
+# ── SPY MACD filter ────────────────────────────────────────────────────────────
+
+def fetch_spy_histogram():
+    """Fetch SPY weekly OHLCV via Lambda, return MACD histogram Series."""
+    if os.path.exists(SPY_CACHE):
+        print(f'  Loading SPY from cache')
+        with open(SPY_CACHE) as f:
+            rows = json.load(f)
+    else:
+        print('  Fetching SPY data via Lambda...')
+        resp = lam.invoke(
+            FunctionName=FUNC_NAME, InvocationType='RequestResponse',
+            Payload=json.dumps({'op': 'ohlcv_batch', 'tickers': ['SPY'], 'period': '11y'}),
+        )
+        rows = json.loads(resp['Payload'].read())['SPY']
+        with open(SPY_CACHE, 'w') as f:
+            json.dump(rows, f)
+
+    close = pd.Series(
+        {pd.Timestamp(r['date']): r['close'] for r in rows}
+    ).sort_index()
+    hist = macd_histogram(close)
+    print(f'  SPY MACD histogram: {len(hist)} bars, '
+          f'last={hist.index[-1].date()} h={hist.iloc[-1]:.3f}')
+    return hist
+
+
 # ── Main backtest ──────────────────────────────────────────────────────────────
 
-def run_backtest(all_data, yearly_universe):
-    records = []
-
+def run_backtest(all_data, yearly_universe, spy_hist):
+    """
+    Collect all candidate signals, sort chronologically, apply:
+      1. SPY MACD > 0 filter
+      2. MAX_CONCURRENT (20) open-trade cap
+    then simulate accepted trades.
+    """
     tickers = list(all_data.keys())
-    print(f'\nRunning backtest on {len(tickers)} tickers...')
+    print(f'Collecting candidate signals from {len(tickers)} tickers...')
 
-    for i, ticker in enumerate(tickers):
+    # Build per-ticker data frames and detect signals
+    ticker_data  = {}   # ticker -> (dfk, close_s, high_s, low_s, all_dates, signal_date_set)
+    all_candidates = [] # (sig_date, ticker, entry_n)
+
+    for ticker in tickers:
         rows = all_data[ticker]
         if not rows or len(rows) < 40:
             continue
-
         dfk = pd.DataFrame(rows)
         dfk['date'] = pd.to_datetime(dfk['date'])
         dfk = dfk.set_index('date').sort_index()
 
-        close_s = dfk['close']
-        high_s  = dfk['high']
-        low_s   = dfk['low']
+        close_s   = dfk['close']
+        high_s    = dfk['high']
+        low_s     = dfk['low']
         all_dates = dfk.index.tolist()
+        signals   = detect_signals(close_s)
+        sig_set   = {s[0] for s in signals}
 
-        # All signal dates for this ticker (needed for re-entry abort logic)
-        signals = detect_signals(close_s)
-        signal_date_set = {s[0] for s in signals}
+        ticker_data[ticker] = (dfk, close_s, high_s, low_s, all_dates, sig_set)
 
         for (sig_date, entry_n) in signals:
             year = sig_date.year
-            # Only include if ticker was in top-200 that year
             if ticker not in yearly_universe.get(year, set()):
                 continue
             if sig_date not in dfk.index:
                 continue
+            all_candidates.append((sig_date, ticker, entry_n))
 
-            entry_px   = close_s[sig_date]
-            stop_px    = low_s[sig_date]
-            candle_high = high_s[sig_date]
+    # Sort chronologically
+    all_candidates.sort(key=lambda x: x[0])
+    print(f'  {len(all_candidates)} candidates before filters')
 
-            trade = simulate(
-                sig_date, entry_px, stop_px, candle_high,
-                all_dates, close_s, low_s, high_s, signal_date_set,
-            )
-            trade['ticker']   = ticker
-            trade['entry_n']  = entry_n
-            trade['year']     = year
-            records.append(trade)
+    # Apply filters chronologically
+    records      = []
+    # Track open trades: list of exit_date (initial leg only)
+    open_exits   = []   # sorted list of exit dates
+    spy_skipped  = 0
+    cap_skipped  = 0
 
-        if (i + 1) % 50 == 0:
-            print(f'  {i+1}/{len(tickers)} tickers processed, {len(records)} trades so far')
+    for sig_date, ticker, entry_n in all_candidates:
+        # ── Filter 1: SPY MACD must be > 0 ────────────────────────────────────
+        spy_dates = spy_hist.index[spy_hist.index <= sig_date]
+        if len(spy_dates) == 0:
+            spy_skipped += 1; continue
+        spy_h = spy_hist[spy_dates[-1]]
+        if spy_h <= 0:
+            spy_skipped += 1; continue
 
+        # ── Filter 2: max 20 concurrent open trades ────────────────────────────
+        # Expire finished trades
+        open_exits = [d for d in open_exits if d > sig_date]
+        if len(open_exits) >= MAX_CONCURRENT:
+            cap_skipped += 1; continue
+
+        # ── Simulate ───────────────────────────────────────────────────────────
+        dfk, close_s, high_s, low_s, all_dates, sig_set = ticker_data[ticker]
+
+        trade = simulate(
+            sig_date,
+            float(close_s[sig_date]),
+            float(low_s[sig_date]),
+            float(high_s[sig_date]),
+            all_dates, close_s, low_s, high_s, sig_set,
+        )
+        trade['ticker']  = ticker
+        trade['entry_n'] = entry_n
+        trade['year']    = sig_date.year
+
+        # Track exit date for cap (initial leg)
+        if trade['exit_date'] is not None:
+            open_exits.append(trade['exit_date'])
+            open_exits.sort()
+
+        records.append(trade)
+
+    print(f'  SPY-filtered out : {spy_skipped}')
+    print(f'  Cap-filtered out : {cap_skipped}')
+    print(f'  Trades accepted  : {len(records)}')
     return records
 
 
@@ -324,13 +398,17 @@ def main():
     print('\n=== Step 3: Build per-year top-200 universes ===')
     yearly_universe = build_yearly_universes(all_data, shares_map)
 
-    # 4. Run backtest
-    print('\n=== Step 4: Backtest ===')
-    records = run_backtest(all_data, yearly_universe)
+    # 4. Fetch SPY MACD
+    print('\n=== Step 4: SPY regime filter ===')
+    spy_hist = fetch_spy_histogram()
+
+    # 5. Run backtest
+    print('\n=== Step 5: Backtest ===')
+    records = run_backtest(all_data, yearly_universe, spy_hist)
     print(f'  Total trades: {len(records)}')
 
-    # 5. Save CSV
-    print(f'\n=== Step 5: Save to {OUTPUT_CSV} ===')
+    # 6. Save CSV
+    print(f'\n=== Step 6: Save to {OUTPUT_CSV} ===')
     cols = [
         'ticker', 'year', 'entry_n',
         'entry_date', 'entry_price', 'stop', 'candle_high',
@@ -343,7 +421,7 @@ def main():
     df_out.to_csv(OUTPUT_CSV, index=False)
     print(f'  Saved {len(df_out)} rows to {OUTPUT_CSV}')
 
-    # 6. Quick summary
+    # 7. Quick summary
     closed = df_out[df_out['pnl_pct'].notna()]
     wins   = closed[closed['pnl_pct'] > 0]
     stops  = closed[closed['exit_reason'] == 'STOP']
