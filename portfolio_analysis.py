@@ -59,11 +59,10 @@ print('Building per-stock active-period returns...')
 stock_weekly_ret = {d: {} for d in all_dates}  # date -> {ticker: ret}
 
 def apply_trade(ticker, entry_date, entry_price, exit_date, exit_price, exit_reason):
-    """Fill in weekly returns for one trade leg."""
+    """Fill in weekly returns for one stock trade leg (mark-to-market each week)."""
     if ticker not in price:
         return
     s = price[ticker]
-    # Find all weekly dates strictly between entry and exit (inclusive of exit)
     mask = (s.index > entry_date) & (s.index <= exit_date)
     trade_dates = s.index[mask]
     if len(trade_dates) == 0:
@@ -73,27 +72,53 @@ def apply_trade(ticker, entry_date, entry_price, exit_date, exit_price, exit_rea
     for i, d in enumerate(trade_dates):
         is_last = (i == len(trade_dates) - 1)
         if is_last:
-            curr = exit_price  # stop or 8W close
+            curr = exit_price
         else:
             curr = s.get(d, np.nan)
             if np.isnan(curr):
-                curr = prev_price  # flat if missing
+                curr = prev_price
 
         ret = (curr / prev_price - 1) if prev_price > 0 else 0.0
         if d in stock_weekly_ret:
             stock_weekly_ret[d][ticker] = stock_weekly_ret[d].get(ticker, 0) + ret
         prev_price = curr
 
+
+def apply_trade_option(ticker, entry_date, exit_date, pnl_pct_val):
+    """
+    Fill in weekly returns for one option leg.
+    P&L is realised only at expiry (all intermediate weeks = 0).
+    """
+    if ticker not in price or pd.isna(exit_date) or pd.isna(pnl_pct_val):
+        return
+    s = price[ticker]
+    mask = (s.index > entry_date) & (s.index <= exit_date)
+    trade_dates = s.index[mask]
+    if len(trade_dates) == 0:
+        return
+    last_d = trade_dates[-1]
+    if last_d in stock_weekly_ret:
+        stock_weekly_ret[last_d][ticker] = (
+            stock_weekly_ret[last_d].get(ticker, 0) + pnl_pct_val / 100
+        )
+
+
+IS_OPTION = 'trade_mode' in trades.columns and (trades['trade_mode'] == 'option').any()
+
 for _, row in trades.iterrows():
     ticker = row['ticker']
     if pd.isna(row['exit_date']):
         continue
-    apply_trade(ticker, row['entry_date'], row['entry_price'],
-                row['exit_date'], row['exit_price'], row['exit_reason'])
-    # Re-entry leg
-    if pd.notna(row['re_entry_date']) and pd.notna(row['re_exit_date']):
-        apply_trade(ticker, row['re_entry_date'], row['re_entry_price'],
-                    row['re_exit_date'], row['re_exit_price'], row['re_exit_reason'])
+    if IS_OPTION:
+        apply_trade_option(ticker, row['entry_date'], row['exit_date'], row['pnl_pct'])
+        if pd.notna(row['re_entry_date']) and pd.notna(row['re_exit_date']):
+            apply_trade_option(ticker, row['re_entry_date'], row['re_exit_date'], row['re_pnl_pct'])
+    else:
+        apply_trade(ticker, row['entry_date'], row['entry_price'],
+                    row['exit_date'], row['exit_price'], row['exit_reason'])
+        if pd.notna(row['re_entry_date']) and pd.notna(row['re_exit_date']):
+            apply_trade(ticker, row['re_entry_date'], row['re_entry_price'],
+                        row['re_exit_date'], row['re_exit_price'], row['re_exit_reason'])
 
 # ── 3. Portfolio weekly returns ───────────────────────────────────────────────
 print('Aggregating portfolio returns...')
@@ -216,7 +241,8 @@ for yr, ret in annual_ret.items():
 # ── 8. Chart ──────────────────────────────────────────────────────────────────
 print(f'\nGenerating chart → {OUTPUT_PNG}')
 fig = plt.figure(figsize=(14, 13), facecolor='#0d1117')
-fig.suptitle('SPX Top-200  |  Weekly MACD 2nd-Entry  |  SPY Filter + 20-Trade Cap  |  1/200 Weight',
+mode_label = 'Call Options (3% premium, 8W)' if IS_OPTION else 'Stock'
+fig.suptitle(f'SPX Top-200  |  Weekly MACD 2nd-Entry  |  SPY Filter  |  {mode_label}  |  1/200 Weight',
              color='white', fontsize=13, fontweight='bold', y=0.98)
 
 gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1.8, 1.8, 1.2], hspace=0.08,

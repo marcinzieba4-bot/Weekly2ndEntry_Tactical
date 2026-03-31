@@ -3,14 +3,14 @@ backtest_top200.py
 ==================
 For each calendar year, identify the 200 largest stocks (by approx market cap =
 year-start close × current shares outstanding), detect weekly MACD (12,26,9)
-2nd+ histogram-upturn entries, and simulate trades with:
+2nd+ histogram-upturn entries, and simulate ATM call option trades with:
 
-  Entry      : close of signal candle
-  Stop-loss  : low of signal candle
-  Exit       : close 8 weeks later
-  Re-entry   : if stopped out and price later closes above signal candle high
-               → re-enter at that close, new stop = low of re-entry candle,
-                 new 8-week clock; skipped if a new MACD signal fires first
+  Mode       : call option (ATM, 3% premium, 8-week duration)
+  Entry      : close of signal candle → buy ATM call, pay OPTION_PREMIUM %
+  Exit       : always close 8 weeks later (no intraweek stop-outs for options)
+  P&L        : max(0, stock_return_8w × 100) − OPTION_PREMIUM  (percent)
+  Re-entry   : if option expires OTM (exit_close < entry_price) and price later
+               closes above signal candle high → buy another call, same rules
 
 Filters applied:
   SPY filter : SPY weekly MACD histogram must be > 0 on signal date
@@ -33,6 +33,7 @@ FUNC_NAME     = 'yfinance-data-fetcher'
 BATCH_SIZE    = 15          # tickers per Lambda invocation
 MAX_WORKERS   = 20          # parallel Lambda invocations
 TOP_N         = 200         # universe size per year
+OPTION_PREMIUM = 3.0        # ATM call premium, % of notional (8-week duration)
 UNIVERSE_FILE = '/tmp/sp500_universe.json'
 DATA_CACHE    = '/tmp/ohlcv_cache.json'
 SPY_CACHE     = '/tmp/spy_cache.json'
@@ -147,6 +148,63 @@ def simulate(signal_date, entry_px, stop_px, candle_high,
                     re_exit_reason=re_reason, re_pnl_pct=re_pnl,
                 )
                 break
+    return t
+
+
+# ── Option simulation ─────────────────────────────────────────────────────────
+
+def simulate_option(signal_date, entry_px, candle_high,
+                    all_dates, close_s, signal_date_set):
+    """
+    Simulate one ATM call option + optional re-entry.
+
+    - Always hold 8 weeks (no intraweek stop-outs).
+    - pnl_pct = max(0, stock_8w_return × 100) − OPTION_PREMIUM
+    - Re-entry: if option expires OTM (exit_close < entry_px) and price later
+      closes above candle_high → buy another call with same mechanics.
+    """
+    future_idx = all_dates.index(signal_date) + 1
+    future     = all_dates[future_idx: future_idx + 8]
+
+    t = dict(
+        entry_date=signal_date, entry_price=round(entry_px, 4),
+        stop=None, candle_high=round(candle_high, 4),
+        exit_date=None, exit_price=None, exit_reason=None, pnl_pct=None,
+        re_entry_date=None, re_entry_price=None, re_stop=None,
+        re_exit_date=None, re_exit_price=None, re_exit_reason=None, re_pnl_pct=None,
+        trade_mode='option',
+    )
+
+    if not future:
+        return t
+
+    exit_d     = future[-1]
+    exit_close = float(close_s[exit_d])
+    pnl        = round(max(0.0, (exit_close / entry_px - 1) * 100) - OPTION_PREMIUM, 2)
+    t.update(exit_date=exit_d, exit_price=round(exit_close, 4),
+             exit_reason='8W', pnl_pct=pnl)
+
+    # Re-entry only when option expired OTM
+    if exit_close < entry_px:
+        re_start = all_dates.index(exit_d) + 1
+        for d in all_dates[re_start:]:
+            if d in signal_date_set and d != signal_date:
+                break                              # new MACD signal → skip
+            if close_s[d] > candle_high:
+                re_px      = float(close_s[d])
+                re_fut     = all_dates[all_dates.index(d) + 1: all_dates.index(d) + 9]
+                if re_fut:
+                    re_exit_d  = re_fut[-1]
+                    re_close   = float(close_s[re_exit_d])
+                    re_pnl     = round(max(0.0, (re_close / re_px - 1) * 100) - OPTION_PREMIUM, 2)
+                    t.update(
+                        re_entry_date=d, re_entry_price=round(re_px, 4),
+                        re_stop=None,
+                        re_exit_date=re_exit_d, re_exit_price=round(re_close, 4),
+                        re_exit_reason='8W', re_pnl_pct=re_pnl,
+                    )
+                break
+
     return t
 
 
@@ -317,12 +375,11 @@ def run_backtest(all_data, yearly_universe, spy_hist):
         # ── Simulate ───────────────────────────────────────────────────────────
         dfk, close_s, high_s, low_s, all_dates, sig_set = ticker_data[ticker]
 
-        trade = simulate(
+        trade = simulate_option(
             sig_date,
             float(close_s[sig_date]),
-            float(low_s[sig_date]),
             float(high_s[sig_date]),
-            all_dates, close_s, low_s, high_s, sig_set,
+            all_dates, close_s, sig_set,
         )
         trade['ticker']  = ticker
         trade['entry_n'] = entry_n
@@ -391,7 +448,7 @@ def main():
     # 6. Save CSV
     print(f'\n=== Step 6: Save to {OUTPUT_CSV} ===')
     cols = [
-        'ticker', 'year', 'entry_n',
+        'ticker', 'year', 'entry_n', 'trade_mode',
         'entry_date', 'entry_price', 'stop', 'candle_high',
         'exit_date', 'exit_price', 'exit_reason', 'pnl_pct',
         're_entry_date', 're_entry_price', 're_stop',
@@ -402,29 +459,26 @@ def main():
     df_out.to_csv(OUTPUT_CSV, index=False)
     print(f'  Saved {len(df_out)} rows to {OUTPUT_CSV}')
 
-    # 7. Quick summary
-    closed = df_out[df_out['pnl_pct'].notna()]
-    wins   = closed[closed['pnl_pct'] > 0]
-    stops  = closed[closed['exit_reason'] == 'STOP']
-    tw     = closed[closed['exit_reason'] == '8W']
-
+    # 7. Quick summary  (options — all exits are 8W)
+    closed    = df_out[df_out['pnl_pct'].notna()]
+    wins      = closed[closed['pnl_pct'] > 0]
+    losers    = closed[closed['pnl_pct'] <= 0]
     re_closed = df_out[df_out['re_pnl_pct'].notna()]
     re_wins   = re_closed[re_closed['re_pnl_pct'] > 0]
 
     print(f"""
-══ Summary ══════════════════════════════════════════
+══ Option Summary ({OPTION_PREMIUM}% premium, 8W duration) ══════════
   Trades          : {len(closed)}
-  Win rate        : {100*len(wins)/len(closed):.1f}%
-  Stopped out     : {len(stops)}  ({100*len(stops)/len(closed):.1f}%)
-  8-week exits    : {len(tw)}   ({100*len(tw)/len(closed):.1f}%)
+  ITM at expiry   : {len(wins)}  ({100*len(wins)/len(closed):.1f}%)
+  OTM at expiry   : {len(losers)}  ({100*len(losers)/len(closed):.1f}%)
   Avg P&L         : {closed['pnl_pct'].mean():+.2f}%
-  Avg winner      : {wins['pnl_pct'].mean():+.2f}%
-  Avg loser       : {closed[closed['pnl_pct']<=0]['pnl_pct'].mean():+.2f}%
+  Avg ITM P&L     : {wins['pnl_pct'].mean():+.2f}%   (winners)
+  Avg OTM P&L     : {losers['pnl_pct'].mean():+.2f}%  (losers = −{OPTION_PREMIUM}%)
   Best trade      : {closed['pnl_pct'].max():+.2f}%
   Worst trade     : {closed['pnl_pct'].min():+.2f}%
 
   Re-entries taken: {len(re_closed)}
-  Re-entry WR     : {100*len(re_wins)/max(len(re_closed),1):.1f}%
+  Re-entry ITM WR : {100*len(re_wins)/max(len(re_closed),1):.1f}%
   Avg re-entry P&L: {re_closed['re_pnl_pct'].mean():+.2f}%
 ══════════════════════════════════════════════════════
 """)
