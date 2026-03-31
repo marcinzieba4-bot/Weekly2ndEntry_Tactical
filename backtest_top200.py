@@ -14,7 +14,6 @@ year-start close × current shares outstanding), detect weekly MACD (12,26,9)
 
 Filters applied:
   SPY filter : SPY weekly MACD histogram must be > 0 on signal date
-  Cap filter : max 20 concurrent open trades (FIFO — first-come first-served)
 
 Data fetched via AWS Lambda (yfinance inside Lambda has unrestricted internet).
 Results saved to trades_top200.csv.
@@ -34,7 +33,6 @@ FUNC_NAME     = 'yfinance-data-fetcher'
 BATCH_SIZE    = 15          # tickers per Lambda invocation
 MAX_WORKERS   = 20          # parallel Lambda invocations
 TOP_N         = 200         # universe size per year
-MAX_CONCURRENT = 20         # max open trades at any time
 UNIVERSE_FILE = '/tmp/sp500_universe.json'
 DATA_CACHE    = '/tmp/ohlcv_cache.json'
 SPY_CACHE     = '/tmp/spy_cache.json'
@@ -305,26 +303,16 @@ def run_backtest(all_data, yearly_universe, spy_hist):
     print(f'  {len(all_candidates)} candidates before filters')
 
     # Apply filters chronologically
-    records      = []
-    # Track open trades: list of exit_date (initial leg only)
-    open_exits   = []   # sorted list of exit dates
-    spy_skipped  = 0
-    cap_skipped  = 0
+    records     = []
+    spy_skipped = 0
 
     for sig_date, ticker, entry_n in all_candidates:
-        # ── Filter 1: SPY MACD must be > 0 ────────────────────────────────────
+        # ── Filter: SPY MACD must be > 0 ──────────────────────────────────────
         spy_dates = spy_hist.index[spy_hist.index <= sig_date]
         if len(spy_dates) == 0:
             spy_skipped += 1; continue
-        spy_h = spy_hist[spy_dates[-1]]
-        if spy_h <= 0:
+        if spy_hist[spy_dates[-1]] <= 0:
             spy_skipped += 1; continue
-
-        # ── Filter 2: max 20 concurrent open trades ────────────────────────────
-        # Expire finished trades
-        open_exits = [d for d in open_exits if d > sig_date]
-        if len(open_exits) >= MAX_CONCURRENT:
-            cap_skipped += 1; continue
 
         # ── Simulate ───────────────────────────────────────────────────────────
         dfk, close_s, high_s, low_s, all_dates, sig_set = ticker_data[ticker]
@@ -339,16 +327,9 @@ def run_backtest(all_data, yearly_universe, spy_hist):
         trade['ticker']  = ticker
         trade['entry_n'] = entry_n
         trade['year']    = sig_date.year
-
-        # Track exit date for cap (initial leg)
-        if trade['exit_date'] is not None:
-            open_exits.append(trade['exit_date'])
-            open_exits.sort()
-
         records.append(trade)
 
     print(f'  SPY-filtered out : {spy_skipped}')
-    print(f'  Cap-filtered out : {cap_skipped}')
     print(f'  Trades accepted  : {len(records)}')
     return records
 
