@@ -186,10 +186,10 @@ def simulate_option(signal_date, entry_px, candle_high, premium_pct,
     t.update(exit_date=exit_d, exit_price=round(exit_close, 4),
              exit_reason='8W', pnl_pct=pnl)
 
-    # Re-entry only when option expired OTM
+    # Re-entry only when option expired OTM, search window capped at 8 weeks
     if exit_close < entry_px:
         re_start = all_dates.index(exit_d) + 1
-        for d in all_dates[re_start:]:
+        for d in all_dates[re_start: re_start + 8]:   # ← 8-week cap
             if d in signal_date_set and d != signal_date:
                 break                              # new MACD signal → skip
             if close_s[d] > candle_high:
@@ -266,16 +266,24 @@ def build_yearly_universes(all_data, shares_map):
     """
     For each year Y, rank tickers by (Jan-Y close) × shares_outstanding.
     Return dict: year -> set of top-N tickers.
+
+    Survivorship-bias fix: a ticker is only eligible for year Y if it has
+    price data from year Y-1 or earlier, meaning it was already trading
+    before the year started.  Tickers that IPO'd during year Y or only
+    appear in later years are excluded.
     """
     years = list(range(2015, 2027))
     universe = {}
 
     for year in years:
-        jan_start = f'{year}-01'
+        prev_year = str(year - 1)
         caps = {}
         for ticker, rows in all_data.items():
             shares = shares_map.get(ticker)
             if not shares:
+                continue
+            # Must have had data in the prior year (existed before this year)
+            if not any(r['date'].startswith(prev_year) for r in rows):
                 continue
             # Find first available close on or after Jan 1 of year
             for row in rows:

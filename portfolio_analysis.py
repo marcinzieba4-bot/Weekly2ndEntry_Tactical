@@ -123,67 +123,47 @@ for _, row in trades.iterrows():
 # ── 3. Portfolio weekly returns ───────────────────────────────────────────────
 print('Aggregating portfolio returns...')
 
-port_rets   = []
-deployed_rets = []   # return on capital actually deployed that week
+port_rets     = []
 n_active_list = []
 
 for d in all_dates:
     active = stock_weekly_ret.get(d, {})
     n      = len(active)
-    # Total portfolio (cash slots = 0, each active = WEIGHT)
-    pr = sum(WEIGHT * r for r in active.values())
-    # Deployed-only: average return of active positions (0 if none active)
-    dr = sum(active.values()) / n if n > 0 else 0.0
+    pr     = sum(WEIGHT * r for r in active.values())
     port_rets.append(pr)
-    deployed_rets.append(dr)
     n_active_list.append(n)
 
-port_rets     = pd.Series(port_rets,     index=all_dates, name='portfolio')
-deployed_rets = pd.Series(deployed_rets, index=all_dates, name='deployed')
-n_active      = pd.Series(n_active_list, index=all_dates, name='n_active')
+port_rets = pd.Series(port_rets,     index=all_dates, name='portfolio')
+n_active  = pd.Series(n_active_list, index=all_dates, name='n_active')
 
-port_rets     = port_rets    [port_rets.index     >= '2015-01-01']
-deployed_rets = deployed_rets[deployed_rets.index >= '2015-01-01']
-n_active      = n_active     [n_active.index      >= '2015-01-01']
+port_rets = port_rets[port_rets.index >= '2015-01-01']
+n_active  = n_active [n_active.index  >= '2015-01-01']
 
-# ── 4. Equity curves & drawdown ───────────────────────────────────────────────
-equity    = (1 + port_rets).cumprod()
-eq_dep    = (1 + deployed_rets).cumprod()   # deployed-capital equity
-roll_max  = equity.cummax()
-drawdown  = (equity / roll_max - 1)
-dd_dep    = (eq_dep / eq_dep.cummax() - 1)
-util_pct  = (n_active / N_SLOTS * 100).rolling(4).mean()   # 4-week smoothed utilisation
+# ── 4. Equity curve & drawdown ────────────────────────────────────────────────
+equity   = (1 + port_rets).cumprod()
+roll_max = equity.cummax()
+drawdown = (equity / roll_max - 1)
+avg_util = n_active.mean() / N_SLOTS
+util_pct = (n_active / N_SLOTS * 100).rolling(4).mean()
 
 # ── 5. Risk statistics ────────────────────────────────────────────────────────
 weeks_per_year = 52
 rf_weekly      = (1 + RISK_FREE) ** (1 / weeks_per_year) - 1
-
 total_weeks    = len(port_rets)
 years          = total_weeks / weeks_per_year
 
-# ── full portfolio stats ──────────────────────────────────────────────────────
-total_return   = equity.iloc[-1] - 1
-cagr           = (equity.iloc[-1]) ** (1 / years) - 1
-vol_ann        = port_rets.std() * np.sqrt(weeks_per_year)
-sharpe         = (cagr - RISK_FREE) / vol_ann
-downside       = port_rets[port_rets < rf_weekly] - rf_weekly
-sortino_denom  = downside.std() * np.sqrt(weeks_per_year)
-sortino        = (cagr - RISK_FREE) / sortino_denom if sortino_denom > 0 else np.nan
-max_dd         = drawdown.min()
-calmar         = cagr / abs(max_dd) if max_dd != 0 else np.nan
+total_return  = equity.iloc[-1] - 1
+cagr          = (equity.iloc[-1]) ** (1 / years) - 1
+vol_ann       = port_rets.std() * np.sqrt(weeks_per_year)
+sharpe        = (cagr - RISK_FREE) / vol_ann
+downside      = port_rets[port_rets < rf_weekly] - rf_weekly
+sortino_denom = downside.std() * np.sqrt(weeks_per_year)
+sortino       = (cagr - RISK_FREE) / sortino_denom if sortino_denom > 0 else np.nan
+max_dd        = drawdown.min()
+calmar        = cagr / abs(max_dd) if max_dd != 0 else np.nan
 
-# ── deployed-capital stats ────────────────────────────────────────────────────
-dep_active     = deployed_rets[n_active > 0]
-dep_tr         = eq_dep.iloc[-1] - 1
-dep_cagr       = (eq_dep.iloc[-1]) ** (1 / years) - 1
-dep_vol        = dep_active.std() * np.sqrt(weeks_per_year) if len(dep_active) > 1 else np.nan
-dep_sharpe     = (dep_cagr - RISK_FREE) / dep_vol if dep_vol else np.nan
-dep_max_dd     = dd_dep.min()
-avg_util       = n_active.mean() / N_SLOTS
-
-# Max drawdown duration
 in_dd = drawdown < 0
-dd_dur = 0; cur_dur = 0; max_dd_dur = 0
+cur_dur = 0; max_dd_dur = 0
 for v in in_dd:
     if v: cur_dur += 1; max_dd_dur = max(max_dd_dur, cur_dur)
     else: cur_dur = 0
@@ -193,69 +173,55 @@ lose_trades = trades[trades['pnl_pct'] <= 0]
 win_rate    = len(win_trades) / len(trades[trades['pnl_pct'].notna()])
 avg_win     = win_trades['pnl_pct'].mean()
 avg_loss    = lose_trades['pnl_pct'].mean()
+profit_factor = abs(avg_win * len(win_trades)) / abs(avg_loss * len(lose_trades))
 
 # ── 6. Annual returns ─────────────────────────────────────────────────────────
-annual_ret     = port_rets.resample('YE').apply(lambda x: (1+x).prod() - 1)
+annual_ret       = port_rets.resample('YE').apply(lambda x: (1+x).prod() - 1)
 annual_ret.index = annual_ret.index.year
-
-dep_annual_ret = deployed_rets.resample('YE').apply(lambda x: (1+x).prod() - 1)
-dep_annual_ret.index = dep_annual_ret.index.year
-
-avg_annual_dep = dep_annual_ret.mean()
-avg_annual_full = annual_ret.mean()
-
-# Max DD duration (deployed)
-in_dd_dep = dd_dep < 0
-cur_dur = 0; dep_max_dd_dur = 0
-for v in in_dd_dep:
-    if v: cur_dur += 1; dep_max_dd_dur = max(dep_max_dd_dur, cur_dur)
-    else: cur_dur = 0
+avg_annual       = annual_ret.mean()
 
 # ── 7. Print stats ────────────────────────────────────────────────────────────
+avg_prem_str = f"{trades['premium_pct'].mean():.2f}%" if 'premium_pct' in trades.columns else 'N/A'
+
 print(f"""
 ╔══════════════════════════════════════════════════════════════╗
   STRATEGY: SPX Top-200 | Weekly MACD 2nd-Entry | SPY Filter
-  OPTIONS:  ATM call, real IV premiums ×1.17, 8-week hold
+  OPTIONS:  ATM call, real IV×1.17, 8W hold | 1/200 equal weight
   PERIOD:   {port_rets.index[0].date()} → {port_rets.index[-1].date()}
 ╚══════════════════════════════════════════════════════════════╝
 
-  ── Deployed Capital (active option positions) ────────────
-  Total return        : {dep_tr:+.1%}
-  CAGR                : {dep_cagr:+.1%}
-  Avg annual return   : {avg_annual_dep:+.1%}  (simple mean of yearly returns)
-  Ann. volatility     : {dep_vol:.1%}
-  Sharpe ratio        : {dep_sharpe:.2f}  (rf={RISK_FREE:.0%})
-  Max drawdown        : {dep_max_dd:.1%}
-  Max DD duration     : {dep_max_dd_dur} weeks
-  Calmar ratio        : {dep_cagr/abs(dep_max_dd) if dep_max_dd != 0 else float('nan'):.2f}
-
-  ── Full Portfolio (1/200 weight, cash for idle slots) ────
-  Avg capital deployed: {avg_util:.1%}  (avg {n_active.mean():.1f} / {N_SLOTS} slots)
+  ── Portfolio (equal weight 1/200, cash for idle slots) ───
+  Avg slots active    : {n_active.mean():.1f} / {N_SLOTS}  ({avg_util:.1%} utilisation)
+  Total return        : {total_return:+.1%}
   CAGR                : {cagr:+.1%}
-  Sharpe ratio        : {sharpe:.2f}
+  Avg annual return   : {avg_annual:+.1%}
+  Ann. volatility     : {vol_ann:.1%}
+  Sharpe ratio        : {sharpe:.2f}  (rf={RISK_FREE:.0%})
+  Sortino ratio       : {sortino:.2f}
   Max drawdown        : {max_dd:.1%}
+  Max DD duration     : {max_dd_dur} weeks
+  Calmar ratio        : {calmar:.2f}
 
   ── Trade-level stats ──────────────────────────────────────
   Total trades        : {len(trades[trades['pnl_pct'].notna()])}
   ITM rate            : {win_rate:.1%}
   Avg winner          : +{avg_win:.2f}%
   Avg loser           : {avg_loss:.2f}%
-  Profit factor       : {abs(avg_win * len(win_trades)) / abs(avg_loss * len(lose_trades)):.2f}
-  Avg 8W premium      : {'N/A' if 'premium_pct' not in trades.columns else f"{trades['premium_pct'].mean():.2f}%"}
+  Profit factor       : {profit_factor:.2f}
+  Avg 8W premium      : {avg_prem_str}
 ══════════════════════════════════════════════════════════════
 
-  Year   Full port   Deployed    # trades
-  ────   ─────────   ────────    ────────""")
+  Year   Return    # trades
+  ────   ──────    ────────""")
 
 trades['entry_date'] = pd.to_datetime(trades['entry_date'])
 for yr in sorted(annual_ret.index):
-    fp  = annual_ret.get(yr, float('nan'))
-    dep = dep_annual_ret.get(yr, float('nan'))
+    ret = annual_ret.get(yr, float('nan'))
     n   = (trades['entry_date'].dt.year == yr).sum()
-    fp_s  = f'{fp:+.1%}' if not pd.isna(fp)  else '  N/A'
-    dep_s = f'{dep:+.1%}' if not pd.isna(dep) else '  N/A'
-    mark  = ' ◄' if not pd.isna(dep) and dep < -0.10 else ''
-    print(f"  {yr}   {fp_s:>9}   {dep_s:>8}    {n:>4}{mark}")
+    ret_s = f'{ret:+.2%}' if not pd.isna(ret) else '  N/A'
+    bar   = ('█' * int(abs(ret) * 400)) if not pd.isna(ret) else ''
+    sign  = '+' if (not pd.isna(ret) and ret >= 0) else '-'
+    print(f"  {yr}   {ret_s:>8}    {n:>4}   {bar}")
 
 print()
 
@@ -270,31 +236,27 @@ BLUE  = '#58a6ff'
 GREY  = '#8b949e'
 WHITE = '#e6edf3'
 
-if IS_OPTION and 'premium_pct' in trades.columns:
-    avg_p = trades['premium_pct'].mean()
-    mode_label = f'Call Options  |  Real IV  |  Avg {avg_p:.1f}% 8W premium'
-elif IS_OPTION:
-    mode_label = 'Call Options  |  Real IV  |  8W hold'
-else:
-    mode_label = 'Stock positions'
+avg_p      = trades['premium_pct'].mean() if 'premium_pct' in trades.columns else None
+mode_label = (f'Call Options  ·  Real IV  ·  Avg {avg_p:.1f}% 8W premium' if avg_p
+              else ('Call Options' if IS_OPTION else 'Stock'))
 
-fig = plt.figure(figsize=(14, 15), facecolor=DARK)
+fig = plt.figure(figsize=(14, 14), facecolor=DARK)
 fig.suptitle(
-    f'SPX Top-200  ·  Weekly MACD 2nd-Entry  ·  SPY Filter  ·  {mode_label}',
+    f'SPX Top-200  ·  Weekly MACD 2nd-Entry  ·  SPY Filter  ·  {mode_label}  ·  1/200 Weight',
     color=WHITE, fontsize=13, fontweight='bold', y=0.99,
 )
 
 gs = gridspec.GridSpec(4, 2,
-    height_ratios=[2.8, 1.8, 1.6, 1.6],
+    height_ratios=[2.6, 1.8, 1.6, 1.6],
     width_ratios=[3, 1],
-    hspace=0.10, wspace=0.08,
+    hspace=0.12, wspace=0.08,
     left=0.07, right=0.97, top=0.96, bottom=0.05,
 )
 
-ax1  = fig.add_subplot(gs[0, 0])   # equity curves (deployed)
+ax1  = fig.add_subplot(gs[0, 0])   # equity curve
 ax1r = fig.add_subplot(gs[0, 1])   # stats table
-ax2  = fig.add_subplot(gs[1, :])   # annual returns (deployed, side-by-side full)
-ax3  = fig.add_subplot(gs[2, 0])   # drawdown (deployed)
+ax2  = fig.add_subplot(gs[1, :])   # annual returns
+ax3  = fig.add_subplot(gs[2, 0])   # drawdown
 ax4  = fig.add_subplot(gs[2, 1])   # trade P&L histogram
 ax5  = fig.add_subplot(gs[3, :])   # cumulative per-trade P&L
 
@@ -306,113 +268,100 @@ for ax in (ax1, ax2, ax3, ax4, ax5):
 ax1r.set_facecolor(DARK)
 ax1r.axis('off')
 
-# ── Panel 1: Equity curves ────────────────────────────────────────────────────
-ax1.plot(eq_dep.index, eq_dep.values, color=GOLD, linewidth=1.6,
-         label=f'Deployed capital  CAGR {dep_cagr:+.1%}')
-ax1.plot(equity.index, equity.values, color=BLUE, linewidth=1.0, alpha=0.6,
-         linestyle=':', label=f'Full portfolio  CAGR {cagr:+.1%}')
-ax1.fill_between(eq_dep.index, 1, eq_dep.values,
-                 where=(eq_dep.values >= 1), alpha=0.12, color=GREEN)
-ax1.fill_between(eq_dep.index, 1, eq_dep.values,
-                 where=(eq_dep.values <  1), alpha=0.12, color=RED)
+# ── Panel 1: Equity curve ────────────────────────────────────────────────────
+ax1.plot(equity.index, equity.values, color=BLUE, linewidth=1.6,
+         label=f'Portfolio  CAGR {cagr:+.1%}')
+ax1.fill_between(equity.index, 1, equity.values,
+                 where=(equity.values >= 1), alpha=0.12, color=GREEN)
+ax1.fill_between(equity.index, 1, equity.values,
+                 where=(equity.values <  1), alpha=0.12, color=RED)
 ax1.axhline(1, color=GREY, linewidth=0.5, linestyle='--')
-ax1.legend(loc='upper left', fontsize=8, facecolor='#161b22',
+ax1.legend(loc='upper left', fontsize=8.5, facecolor='#161b22',
            edgecolor='#30363d', labelcolor=WHITE)
-ax1.set_ylabel('Growth of $1 (deployed)', color=GREY, fontsize=8.5)
-ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:.1f}'))
+ax1.set_ylabel('Growth of $1  (1/200 weight)', color=GREY, fontsize=8.5)
+ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'${x:.3f}'))
 ax1.grid(axis='y', color='#21262d', linewidth=0.4)
 ax1.set_xticklabels([])
-ax1.set_title('Cumulative P&L — Deployed Capital', color=GREY, fontsize=9, pad=4)
+ax1.set_title('Portfolio Equity Curve  (equal weight, cash for idle slots)', color=GREY, fontsize=9, pad=4)
 
 # ── Panel 1R: Stats table ─────────────────────────────────────────────────────
-profit_factor = abs(avg_win * len(win_trades)) / abs(avg_loss * len(lose_trades))
 stats_lines = [
-    ('DEPLOYED CAPITAL', ''),
-    ('CAGR',             f'{dep_cagr:+.1%}'),
-    ('Avg annual ret',   f'{avg_annual_dep:+.1%}'),
-    ('Ann. volatility',  f'{dep_vol:.1%}'),
-    ('Sharpe ratio',     f'{dep_sharpe:.2f}'),
-    ('Max drawdown',     f'{dep_max_dd:.1%}'),
-    ('Max DD duration',  f'{dep_max_dd_dur}w'),
-    ('Calmar ratio',     f'{dep_cagr/abs(dep_max_dd) if dep_max_dd!=0 else 0:.2f}'),
+    ('PORTFOLIO  1/200', ''),
+    ('CAGR',            f'{cagr:+.1%}'),
+    ('Avg annual ret',  f'{avg_annual:+.1%}'),
+    ('Ann. volatility', f'{vol_ann:.1%}'),
+    ('Sharpe ratio',    f'{sharpe:.2f}'),
+    ('Sortino ratio',   f'{sortino:.2f}'),
+    ('Max drawdown',    f'{max_dd:.1%}'),
+    ('Max DD dur',      f'{max_dd_dur}w'),
+    ('Calmar ratio',    f'{calmar:.2f}'),
+    ('Avg utilisation', f'{avg_util:.1%}'),
     ('', ''),
     ('TRADES', ''),
-    ('Total',            f'{len(trades[trades["pnl_pct"].notna()])}'),
-    ('ITM rate',         f'{win_rate:.1%}'),
-    ('Avg winner',       f'+{avg_win:.1f}%'),
-    ('Avg loser',        f'{avg_loss:.1f}%'),
-    ('Profit factor',    f'{profit_factor:.2f}'),
+    ('Total',           f'{len(trades[trades["pnl_pct"].notna()])}'),
+    ('ITM rate',        f'{win_rate:.1%}'),
+    ('Avg winner',      f'+{avg_win:.1f}%'),
+    ('Avg loser',       f'{avg_loss:.1f}%'),
+    ('Profit factor',   f'{profit_factor:.2f}'),
 ]
 y0 = 0.98
 for label, val in stats_lines:
     if val == '':
-        col = GOLD if label else GREY
         ax1r.text(0.05, y0, label, transform=ax1r.transAxes,
-                  color=col, fontsize=8.5, fontweight='bold')
+                  color=GOLD if label else GREY, fontsize=8.5, fontweight='bold')
     else:
-        ax1r.text(0.05, y0, label, transform=ax1r.transAxes,
-                  color=GREY, fontsize=8)
-        color_val = WHITE
-        if label == 'Max drawdown': color_val = RED
-        elif label in ('CAGR', 'Avg annual ret', 'Sharpe ratio', 'Profit factor', 'Calmar ratio'):
-            color_val = GREEN if (val.startswith('+') or (val[0].isdigit() and float(val.split()[0]) > 0)) else RED
-        ax1r.text(0.65, y0, val, transform=ax1r.transAxes,
-                  color=color_val, fontsize=8, fontweight='bold', ha='right')
-    y0 -= 0.065
+        ax1r.text(0.05, y0, label, transform=ax1r.transAxes, color=GREY, fontsize=8)
+        if label == 'Max drawdown':
+            cv = RED
+        elif label in ('CAGR', 'Avg annual ret', 'Sharpe ratio', 'Sortino ratio',
+                       'Profit factor', 'Calmar ratio'):
+            cv = GREEN if val.startswith('+') or (val[0].isdigit() and float(val) > 0) else RED
+        else:
+            cv = WHITE
+        ax1r.text(0.68, y0, val, transform=ax1r.transAxes,
+                  color=cv, fontsize=8, fontweight='bold', ha='right')
+    y0 -= 0.058
 
-# ── Panel 2: Annual returns (deployed vs full, side-by-side) ─────────────────
-years_idx = sorted(set(dep_annual_ret.index) | set(annual_ret.index))
-x    = np.arange(len(years_idx))
-w    = 0.38
-dep_vals  = [dep_annual_ret.get(yr, 0) * 100 for yr in years_idx]
-full_vals = [annual_ret.get(yr, 0) * 100 for yr in years_idx]
-
-b1 = ax2.bar(x - w/2, dep_vals,  width=w, zorder=3,
-             color=[GREEN if v >= 0 else RED for v in dep_vals],  alpha=0.9,
-             label='Deployed capital')
-b2 = ax2.bar(x + w/2, full_vals, width=w, zorder=3,
-             color=[BLUE if v >= 0 else '#6e40c9' for v in full_vals], alpha=0.6,
-             label='Full portfolio')
-
+# ── Panel 2: Annual returns ────────────────────────────────────────────────────
+yrs   = sorted(annual_ret.index)
+x     = np.arange(len(yrs))
+vals  = [annual_ret.get(yr, 0) * 100 for yr in yrs]
+bars  = ax2.bar(x, vals, width=0.6, zorder=3,
+                color=[GREEN if v >= 0 else RED for v in vals], alpha=0.88)
 ax2.axhline(0, color=GREY, linewidth=0.6)
 ax2.set_ylabel('Annual Return %', color=GREY, fontsize=8.5)
 ax2.set_xticks(x)
-ax2.set_xticklabels(years_idx, color=GREY, fontsize=8.5)
+ax2.set_xticklabels(yrs, color=GREY, fontsize=8.5)
 ax2.grid(axis='y', color='#21262d', linewidth=0.4, zorder=0)
-ax2.legend(fontsize=8, facecolor='#161b22', edgecolor='#30363d', labelcolor=WHITE, loc='upper left')
-ax2.set_title('Annual Returns', color=GREY, fontsize=9, pad=4)
-
-for bar, val in zip(b1, dep_vals):
-    if abs(val) < 0.5: continue
+ax2.set_title(f'Annual Returns  (avg {avg_annual:+.2%}/yr)', color=GREY, fontsize=9, pad=4)
+for bar, val in zip(bars, vals):
+    if abs(val) < 0.05: continue
     ax2.text(bar.get_x() + bar.get_width()/2,
-             val + (0.5 if val >= 0 else -0.5),
-             f'{val:+.0f}%', ha='center',
+             val + (0.02 if val >= 0 else -0.02),
+             f'{val:+.2f}%', ha='center',
              va='bottom' if val >= 0 else 'top',
-             color=WHITE, fontsize=7, fontweight='bold')
+             color=WHITE, fontsize=7.5, fontweight='bold')
 
-# ── Panel 3: Drawdown (deployed) ──────────────────────────────────────────────
-ax3.fill_between(dd_dep.index, dd_dep.values * 100, 0,
+# ── Panel 3: Drawdown ─────────────────────────────────────────────────────────
+ax3.fill_between(drawdown.index, drawdown.values * 100, 0,
                  color=RED, alpha=0.55, linewidth=0)
-ax3.plot(dd_dep.index, dd_dep.values * 100, color=RED, linewidth=0.8)
+ax3.plot(drawdown.index, drawdown.values * 100, color=RED, linewidth=0.8)
 ax3.axhline(0, color=GREY, linewidth=0.4)
-worst_dd_date = dd_dep.idxmin()
-ax3.annotate(f'{dep_max_dd:.1%}',
-             xy=(worst_dd_date, dep_max_dd * 100),
+worst_dd_date = drawdown.idxmin()
+ax3.annotate(f'{max_dd:.2%}',
+             xy=(worst_dd_date, max_dd * 100),
              xytext=(20, 10), textcoords='offset points',
              color=RED, fontsize=8.5, fontweight='bold',
              arrowprops=dict(arrowstyle='->', color=RED, lw=0.8))
 ax3.set_ylabel('Drawdown %', color=GREY, fontsize=8.5)
-ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.0f}%'))
+ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:.1f}%'))
 ax3.grid(axis='y', color='#21262d', linewidth=0.4)
-ax3.set_title('Drawdown — Deployed Capital', color=GREY, fontsize=9, pad=4)
+ax3.set_title('Portfolio Drawdown', color=GREY, fontsize=9, pad=4)
 ax3.tick_params(axis='x', colors=GREY, labelsize=8)
 
 # ── Panel 4: Trade P&L distribution ───────────────────────────────────────────
-all_pnls = pd.concat([
-    trades['pnl_pct'].dropna(),
-    trades['re_pnl_pct'].dropna(),
-])
-bins = np.linspace(all_pnls.min() - 1, min(all_pnls.max() + 1, 50), 50)
+all_pnls = pd.concat([trades['pnl_pct'].dropna(), trades['re_pnl_pct'].dropna()])
+bins  = np.linspace(all_pnls.min() - 0.5, min(all_pnls.max() + 0.5, 50), 50)
 n_itm = (all_pnls > 0).sum()
 n_otm = (all_pnls <= 0).sum()
 ax4.hist(all_pnls[all_pnls > 0],  bins=bins, color=GREEN, alpha=0.75, label=f'ITM {n_itm}')
@@ -426,22 +375,23 @@ ax4.legend(fontsize=7.5, facecolor='#161b22', edgecolor='#30363d', labelcolor=WH
 ax4.grid(axis='y', color='#21262d', linewidth=0.4)
 ax4.set_title('Trade P&L Distribution', color=GREY, fontsize=9, pad=4)
 
-# ── Panel 5: Cumulative per-trade P&L (waterfall-style) ──────────────────────
+# ── Panel 5: Cumulative per-trade P&L ────────────────────────────────────────
 trade_seq = trades[trades['pnl_pct'].notna()].sort_values('entry_date').copy()
 cum_pnl   = trade_seq['pnl_pct'].cumsum().values
 trade_x   = np.arange(len(cum_pnl))
-
 ax5.plot(trade_x, cum_pnl, color=GOLD, linewidth=1.0, zorder=3)
 ax5.fill_between(trade_x, 0, cum_pnl,
                  where=(cum_pnl >= 0), alpha=0.15, color=GREEN, zorder=2)
 ax5.fill_between(trade_x, 0, cum_pnl,
-                 where=(cum_pnl <  0), alpha=0.15, color=RED,   zorder=2)
+                 where=(cum_pnl < 0),  alpha=0.15, color=RED,   zorder=2)
 ax5.axhline(0, color=GREY, linewidth=0.5, linestyle='--')
 ax5.set_xlabel('Trade #', color=GREY, fontsize=8.5)
 ax5.set_ylabel('Cumulative P&L %', color=GREY, fontsize=8.5)
 ax5.grid(axis='y', color='#21262d', linewidth=0.4)
-ax5.set_title(f'Cumulative Trade P&L  (avg per trade {all_pnls.mean():+.2f}%,  total {cum_pnl[-1]:+.0f}%)',
-              color=GREY, fontsize=9, pad=4)
+ax5.set_title(
+    f'Cumulative Trade P&L  (avg/trade {all_pnls.mean():+.2f}%  ·  total {cum_pnl[-1]:+.0f}%)',
+    color=GREY, fontsize=9, pad=4,
+)
 ax5.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f'{x:+.0f}%'))
 
 plt.savefig(OUTPUT_PNG, dpi=150, bbox_inches='tight', facecolor=DARK)
