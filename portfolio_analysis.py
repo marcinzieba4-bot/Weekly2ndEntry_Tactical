@@ -241,7 +241,13 @@ for yr, ret in annual_ret.items():
 # ── 8. Chart ──────────────────────────────────────────────────────────────────
 print(f'\nGenerating chart → {OUTPUT_PNG}')
 fig = plt.figure(figsize=(14, 13), facecolor='#0d1117')
-mode_label = 'Call Options (3% premium, 8W)' if IS_OPTION else 'Stock'
+if IS_OPTION and 'premium_pct' in trades.columns:
+    avg_p = trades['premium_pct'].mean()
+    mode_label = f'Call Options (real IV, avg {avg_p:.1f}% 8W premium)'
+elif IS_OPTION:
+    mode_label = 'Call Options (real IV, 8W)'
+else:
+    mode_label = 'Stock'
 fig.suptitle(f'SPX Top-200  |  Weekly MACD 2nd-Entry  |  SPY Filter  |  {mode_label}  |  1/200 Weight',
              color='white', fontsize=13, fontweight='bold', y=0.98)
 

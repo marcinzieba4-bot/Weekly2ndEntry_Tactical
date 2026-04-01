@@ -26,6 +26,7 @@ import os, json, time, math, concurrent.futures
 import boto3
 import numpy as np
 import pandas as pd
+from options_premiums import load_premiums, PremiumLookup
 
 # ── AWS / Lambda config ────────────────────────────────────────────────────────
 REGION        = 'eu-north-1'
@@ -153,15 +154,15 @@ def simulate(signal_date, entry_px, stop_px, candle_high,
 
 # ── Option simulation ─────────────────────────────────────────────────────────
 
-def simulate_option(signal_date, entry_px, candle_high,
+def simulate_option(signal_date, entry_px, candle_high, premium_pct,
                     all_dates, close_s, signal_date_set):
     """
     Simulate one ATM call option + optional re-entry.
 
     - Always hold 8 weeks (no intraweek stop-outs).
-    - pnl_pct = max(0, stock_8w_return × 100) − OPTION_PREMIUM
+    - pnl_pct = max(0, stock_8w_return × 100) − premium_pct
     - Re-entry: if option expires OTM (exit_close < entry_px) and price later
-      closes above candle_high → buy another call with same mechanics.
+      closes above candle_high → buy another call (same premium_pct).
     """
     future_idx = all_dates.index(signal_date) + 1
     future     = all_dates[future_idx: future_idx + 8]
@@ -169,6 +170,7 @@ def simulate_option(signal_date, entry_px, candle_high,
     t = dict(
         entry_date=signal_date, entry_price=round(entry_px, 4),
         stop=None, candle_high=round(candle_high, 4),
+        premium_pct=round(premium_pct, 4),
         exit_date=None, exit_price=None, exit_reason=None, pnl_pct=None,
         re_entry_date=None, re_entry_price=None, re_stop=None,
         re_exit_date=None, re_exit_price=None, re_exit_reason=None, re_pnl_pct=None,
@@ -180,7 +182,7 @@ def simulate_option(signal_date, entry_px, candle_high,
 
     exit_d     = future[-1]
     exit_close = float(close_s[exit_d])
-    pnl        = round(max(0.0, (exit_close / entry_px - 1) * 100) - OPTION_PREMIUM, 2)
+    pnl        = round(max(0.0, (exit_close / entry_px - 1) * 100) - premium_pct, 2)
     t.update(exit_date=exit_d, exit_price=round(exit_close, 4),
              exit_reason='8W', pnl_pct=pnl)
 
@@ -196,7 +198,7 @@ def simulate_option(signal_date, entry_px, candle_high,
                 if re_fut:
                     re_exit_d  = re_fut[-1]
                     re_close   = float(close_s[re_exit_d])
-                    re_pnl     = round(max(0.0, (re_close / re_px - 1) * 100) - OPTION_PREMIUM, 2)
+                    re_pnl     = round(max(0.0, (re_close / re_px - 1) * 100) - premium_pct, 2)
                     t.update(
                         re_entry_date=d, re_entry_price=round(re_px, 4),
                         re_stop=None,
@@ -317,12 +319,11 @@ def fetch_spy_histogram():
 
 # ── Main backtest ──────────────────────────────────────────────────────────────
 
-def run_backtest(all_data, yearly_universe, spy_hist):
+def run_backtest(all_data, yearly_universe, spy_hist, prem_lookup):
     """
     Collect all candidate signals, sort chronologically, apply:
       1. SPY MACD > 0 filter
-      2. MAX_CONCURRENT (20) open-trade cap
-    then simulate accepted trades.
+    then simulate accepted trades using real per-ticker option premiums.
     """
     tickers = list(all_data.keys())
     print(f'Collecting candidate signals from {len(tickers)} tickers...')
@@ -374,11 +375,13 @@ def run_backtest(all_data, yearly_universe, spy_hist):
 
         # ── Simulate ───────────────────────────────────────────────────────────
         dfk, close_s, high_s, low_s, all_dates, sig_set = ticker_data[ticker]
+        premium = prem_lookup.get_premium(ticker, sig_date)
 
         trade = simulate_option(
             sig_date,
             float(close_s[sig_date]),
             float(high_s[sig_date]),
+            premium,
             all_dates, close_s, sig_set,
         )
         trade['ticker']  = ticker
@@ -440,18 +443,25 @@ def main():
     print('\n=== Step 4: SPY regime filter ===')
     spy_hist = fetch_spy_histogram()
 
+    # 4b. Load real options premiums
+    print('\n=== Step 4b: Load real options premiums ===')
+    prem_data   = load_premiums()
+    prem_lookup = PremiumLookup(prem_data)
+    all_prems   = [v for obs in prem_data.values() for v in obs.values()]
+    print(f'  {len(all_prems)} observations, avg raw 30d premium: {sum(all_prems)/len(all_prems):.2f}%')
+
     # 5. Run backtest
     print('\n=== Step 5: Backtest ===')
-    records = run_backtest(all_data, yearly_universe, spy_hist)
+    records = run_backtest(all_data, yearly_universe, spy_hist, prem_lookup)
     print(f'  Total trades: {len(records)}')
 
     # 6. Save CSV
     print(f'\n=== Step 6: Save to {OUTPUT_CSV} ===')
     cols = [
         'ticker', 'year', 'entry_n', 'trade_mode',
-        'entry_date', 'entry_price', 'stop', 'candle_high',
+        'entry_date', 'entry_price', 'candle_high', 'premium_pct',
         'exit_date', 'exit_price', 'exit_reason', 'pnl_pct',
-        're_entry_date', 're_entry_price', 're_stop',
+        're_entry_date', 're_entry_price',
         're_exit_date', 're_exit_price', 're_exit_reason', 're_pnl_pct',
     ]
     df_out = pd.DataFrame(records)[cols]
@@ -465,9 +475,12 @@ def main():
     losers    = closed[closed['pnl_pct'] <= 0]
     re_closed = df_out[df_out['re_pnl_pct'].notna()]
     re_wins   = re_closed[re_closed['re_pnl_pct'] > 0]
+    avg_prem  = closed['premium_pct'].mean()
+    med_prem  = closed['premium_pct'].median()
 
     print(f"""
-══ Option Summary ({OPTION_PREMIUM}% premium, 8W duration) ══════════
+══ Option Summary (real premiums ×1.17, 8W duration) ══════════
+  Avg 8W premium  : {avg_prem:.2f}%  (median {med_prem:.2f}%)
   Trades          : {len(closed)}
   ITM at expiry   : {len(wins)}  ({100*len(wins)/len(closed):.1f}%)
   OTM at expiry   : {len(losers)}  ({100*len(losers)/len(closed):.1f}%)
