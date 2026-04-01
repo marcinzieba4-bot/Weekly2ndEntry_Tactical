@@ -479,6 +479,37 @@ def main():
     df_out.to_csv(OUTPUT_CSV, index=False)
     print(f'  Saved {len(df_out)} rows to {OUTPUT_CSV}')
 
+    # 6b. Save clean flat CSV (one row per trade leg, re-entries expanded)
+    CLEAN_CSV = OUTPUT_CSV.replace('.csv', '_clean.csv')
+    clean_rows = []
+    for _, r in df_out.iterrows():
+        clean_rows.append({
+            'entry_date':        r['entry_date'],
+            'ticker':            r['ticker'],
+            'exit_date':         r['exit_date'],
+            'stock_entry_price': r['entry_price'],
+            'stock_exit_price':  r['exit_price'],
+            'call_premium_pct':  r['premium_pct'],
+            'pnl_pct':           r['pnl_pct'],
+            'leg':               'primary',
+        })
+        if pd.notna(r.get('re_entry_date')):
+            clean_rows.append({
+                'entry_date':        r['re_entry_date'],
+                'ticker':            r['ticker'],
+                'exit_date':         r['re_exit_date'],
+                'stock_entry_price': r['re_entry_price'],
+                'stock_exit_price':  r['re_exit_price'],
+                'call_premium_pct':  r['premium_pct'],   # same premium as primary
+                'pnl_pct':           r['re_pnl_pct'],
+                'leg':               're_entry',
+            })
+    df_clean = (pd.DataFrame(clean_rows)
+                  .sort_values(['entry_date', 'ticker'])
+                  .reset_index(drop=True))
+    df_clean.to_csv(CLEAN_CSV, index=False)
+    print(f'  Saved {len(df_clean)} rows (incl. re-entries) to {CLEAN_CSV}')
+
     # 7. Quick summary  (options — all exits are 8W)
     closed    = df_out[df_out['pnl_pct'].notna()]
     wins      = closed[closed['pnl_pct'] > 0]
