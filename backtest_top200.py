@@ -26,7 +26,7 @@ import os, json, time, math, concurrent.futures
 import boto3
 import numpy as np
 import pandas as pd
-from options_premiums import load_premiums, PremiumLookup
+from options_premiums import load_premiums, fetch_vix_series, PremiumLookup
 
 # ── AWS / Lambda config ────────────────────────────────────────────────────────
 REGION        = 'eu-north-1'
@@ -443,12 +443,14 @@ def main():
     print('\n=== Step 4: SPY regime filter ===')
     spy_hist = fetch_spy_histogram()
 
-    # 4b. Load real options premiums
-    print('\n=== Step 4b: Load real options premiums ===')
+    # 4b. Load real options premiums + VIX for scaling
+    print('\n=== Step 4b: Load real options premiums + VIX scaling ===')
     prem_data   = load_premiums()
-    prem_lookup = PremiumLookup(prem_data)
+    vix_data    = fetch_vix_series()
+    prem_lookup = PremiumLookup(prem_data, vix_data)
     all_prems   = [v for obs in prem_data.values() for v in obs.values()]
-    print(f'  {len(all_prems)} observations, avg raw 30d premium: {sum(all_prems)/len(all_prems):.2f}%')
+    print(f'  {len(all_prems)} obs, avg raw 30d premium: {sum(all_prems)/len(all_prems):.2f}%')
+    print(f'  VIX scaling active: pre-2020 premiums adjusted to actual vol regime')
 
     # 5. Run backtest
     print('\n=== Step 5: Backtest ===')

@@ -7,14 +7,16 @@ builds a per-ticker / per-date premium-pct lookup, and returns the
 
 Methodology
 -----------
-  premium_pct  = entry_premium / stock_price * 100   (raw, ~30-day DTE)
-  premium_8w   = premium_pct * 1.17                  (vol-curve scale-up)
+  raw_pct      = entry_premium / stock_price * 100   (~30-day DTE)
+  premium_8w   = raw_pct × 1.17 × (VIX_signal / VIX_obs)
 
-For tickers not in the options dataset the closest sector/peer ticker is used.
-For dates before the dataset starts (Sep-2020) the earliest available row
-for that (mapped) ticker is used.
+The VIX scaling corrects for regime differences: pre-2020 signals use
+the earliest available observation (Sep-2020) and are scaled down when
+VIX was lower (e.g. VIX=14 in 2018 vs VIX=24 in Oct-2020 → ×0.58).
+For post-2020 signals obs_date ≈ signal_date so the ratio ≈ 1.
 
 Cache: /tmp/options_premiums_cache.json  (dict: ticker -> {date_str: pct})
+       /tmp/vix_cache.json               (dict: date_str -> vix_close)
 """
 
 import os, io, json, boto3
@@ -26,7 +28,9 @@ REGION    = 'eu-north-1'
 BUCKET    = 's3bucketmz'
 PREFIX    = 'optionsDataCall/'
 CACHE     = '/tmp/options_premiums_cache.json'
+VIX_CACHE = '/tmp/vix_cache.json'
 SCALE_8W  = 1.17          # 30-day → 8-week vol-curve adjustment
+FUNC_NAME = 'yfinance-data-fetcher'
 
 AWS_KEY    = os.environ['AWS_ACCESS_KEY_ID']
 AWS_SECRET = os.environ['AWS_SECRET_ACCESS_KEY']
@@ -215,6 +219,38 @@ def _download_all() -> dict:
     return data
 
 
+def fetch_vix_series(force_refresh: bool = False) -> dict:
+    """
+    Fetch weekly VIX close via Lambda.
+    Returns dict: {date_str: vix_close}
+    """
+    if not force_refresh and os.path.exists(VIX_CACHE):
+        print(f'  Loading VIX from cache: {VIX_CACHE}')
+        with open(VIX_CACHE) as f:
+            return json.load(f)
+
+    print('  Fetching VIX data via Lambda...')
+    lam = boto3.client(
+        'lambda', region_name=REGION,
+        aws_access_key_id=AWS_KEY,
+        aws_secret_access_key=AWS_SECRET,
+        config=Config(read_timeout=300, connect_timeout=10, retries={'max_attempts': 1}),
+    )
+    resp = lam.invoke(
+        FunctionName=FUNC_NAME,
+        InvocationType='RequestResponse',
+        Payload=json.dumps({'op': 'ohlcv_batch', 'tickers': ['^VIX'], 'period': '11y'}),
+    )
+    result = json.loads(resp['Payload'].read())
+    rows   = result.get('^VIX', [])
+    vix    = {r['date'][:10]: float(r['close']) for r in rows if r.get('close')}
+    with open(VIX_CACHE, 'w') as f:
+        json.dump(vix, f)
+    print(f'  VIX: {len(vix)} weekly bars, '
+          f'{min(vix)[:7]} → {max(vix)[:7]}')
+    return vix
+
+
 def load_premiums(force_refresh: bool = False) -> dict:
     """Load premium table, using cache if available."""
     if not force_refresh and os.path.exists(CACHE):
@@ -236,16 +272,35 @@ def load_premiums(force_refresh: bool = False) -> dict:
 
 class PremiumLookup:
     """
-    Callable: get_premium(ticker, signal_date) -> 8-week premium %
-    Uses nearest observation date (not future-looking — takes the most
-    recent observation on or before signal_date; if none, takes earliest).
+    get_premium(ticker, signal_date) -> 8-week premium %
+
+    Formula:
+        premium_8w = raw_30d_pct × 1.17 × (VIX_signal / VIX_obs)
+
+    VIX scaling adjusts for the volatility regime difference between the
+    signal date and the options observation date.  For post-2020 signals
+    the two dates are close so the ratio ≈ 1.  For pre-2020 signals the
+    Sep-2020 obs is used; if VIX was 14 then vs 24 at obs → factor 0.58.
     """
 
-    def __init__(self, data: dict):
-        # Convert to {ticker: sorted list of (date_str, prem_pct)}
-        self._series: dict[str, list] = {}
-        for t, obs in data.items():
-            self._series[t] = sorted(obs.items())   # [(date_str, pct), ...]
+    def __init__(self, data: dict, vix: dict):
+        self._series: dict[str, list] = {
+            t: sorted(obs.items()) for t, obs in data.items()
+        }
+        self._vix: list = sorted(vix.items())   # [(date_str, vix_val), ...]
+
+    def _vix_at(self, date_str: str) -> float:
+        """Return most-recent VIX value on or before date_str."""
+        series = self._vix
+        lo, hi = 0, len(series) - 1
+        best   = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if series[mid][0] <= date_str:
+                best = mid; lo = mid + 1
+            else:
+                hi = mid - 1
+        return series[best][1]
 
     def get_premium(self, ticker: str, signal_date) -> float:
         opt_ticker = resolve_ticker(ticker)
@@ -255,16 +310,21 @@ class PremiumLookup:
 
         sig_str = str(signal_date)[:10]
 
-        # Binary-search for most recent obs <= signal_date
+        # Most-recent obs on or before signal_date
         lo, hi = 0, len(series) - 1
         best   = 0
         while lo <= hi:
             mid = (lo + hi) // 2
             if series[mid][0] <= sig_str:
-                best = mid
-                lo   = mid + 1
+                best = mid; lo = mid + 1
             else:
-                hi   = mid - 1
+                hi = mid - 1
 
-        raw_pct = series[best][1]
-        return round(raw_pct * SCALE_8W, 4)
+        obs_date_str, raw_pct = series[best]
+
+        # VIX scaling
+        vix_sig = self._vix_at(sig_str)
+        vix_obs = self._vix_at(obs_date_str)
+        vix_scale = (vix_sig / vix_obs) if vix_obs > 0 else 1.0
+
+        return round(raw_pct * SCALE_8W * vix_scale, 4)
