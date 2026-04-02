@@ -155,14 +155,16 @@ def simulate(signal_date, entry_px, stop_px, candle_high,
 # ── Option simulation ─────────────────────────────────────────────────────────
 
 def simulate_option(signal_date, entry_px, candle_high, premium_pct,
-                    all_dates, close_s, signal_date_set):
+                    all_dates, close_s, hist_s, signal_date_set):
     """
     Simulate one ATM call option + optional re-entry.
 
     - Always hold 8 weeks (no intraweek stop-outs).
     - pnl_pct = max(0, stock_8w_return × 100) − premium_pct
-    - Re-entry: if option expires OTM (exit_close < entry_px) and price later
+    - Re-entry: if option expires OTM (exit_close < entry_px) AND the MACD
+      histogram is still sub-zero at the candidate re-entry bar AND price
       closes above candle_high → buy another call (same premium_pct).
+      If histogram has already crossed back above zero the setup is gone.
     """
     future_idx = all_dates.index(signal_date) + 1
     future     = all_dates[future_idx: future_idx + 8]
@@ -186,19 +188,22 @@ def simulate_option(signal_date, entry_px, candle_high, premium_pct,
     t.update(exit_date=exit_d, exit_price=round(exit_close, 4),
              exit_reason='8W', pnl_pct=pnl)
 
-    # Re-entry only when option expired OTM, search window capped at 8 weeks
+    # Re-entry: OTM expiry, 8-week search cap, histogram must still be sub-zero
     if exit_close < entry_px:
         re_start = all_dates.index(exit_d) + 1
-        for d in all_dates[re_start: re_start + 8]:   # ← 8-week cap
+        for d in all_dates[re_start: re_start + 8]:
             if d in signal_date_set and d != signal_date:
                 break                              # new MACD signal → skip
+            h = hist_s.get(d, 0.0)
+            if h >= 0:
+                break                              # MACD crossed above zero → setup gone
             if close_s[d] > candle_high:
-                re_px      = float(close_s[d])
-                re_fut     = all_dates[all_dates.index(d) + 1: all_dates.index(d) + 9]
+                re_px  = float(close_s[d])
+                re_fut = all_dates[all_dates.index(d) + 1: all_dates.index(d) + 9]
                 if re_fut:
-                    re_exit_d  = re_fut[-1]
-                    re_close   = float(close_s[re_exit_d])
-                    re_pnl     = round(max(0.0, (re_close / re_px - 1) * 100) - premium_pct, 2)
+                    re_exit_d = re_fut[-1]
+                    re_close  = float(close_s[re_exit_d])
+                    re_pnl    = round(max(0.0, (re_close / re_px - 1) * 100) - premium_pct, 2)
                     t.update(
                         re_entry_date=d, re_entry_price=round(re_px, 4),
                         re_stop=None,
@@ -337,7 +342,7 @@ def run_backtest(all_data, yearly_universe, spy_hist, prem_lookup):
     print(f'Collecting candidate signals from {len(tickers)} tickers...')
 
     # Build per-ticker data frames and detect signals
-    ticker_data  = {}   # ticker -> (dfk, close_s, high_s, low_s, all_dates, signal_date_set)
+    ticker_data  = {}   # ticker -> (dfk, close_s, high_s, low_s, all_dates, hist_dict, signal_date_set)
     all_candidates = [] # (sig_date, ticker, entry_n)
 
     for ticker in tickers:
@@ -355,7 +360,10 @@ def run_backtest(all_data, yearly_universe, spy_hist, prem_lookup):
         signals   = detect_signals(close_s)
         sig_set   = {s[0] for s in signals}
 
-        ticker_data[ticker] = (dfk, close_s, high_s, low_s, all_dates, sig_set)
+        hist_series = macd_histogram(close_s)
+        hist_dict   = {d: float(h) for d, h in hist_series.items() if not pd.isna(h)}
+
+        ticker_data[ticker] = (dfk, close_s, high_s, low_s, all_dates, hist_dict, sig_set)
 
         for (sig_date, entry_n) in signals:
             year = sig_date.year
@@ -382,7 +390,7 @@ def run_backtest(all_data, yearly_universe, spy_hist, prem_lookup):
             spy_skipped += 1; continue
 
         # ── Simulate ───────────────────────────────────────────────────────────
-        dfk, close_s, high_s, low_s, all_dates, sig_set = ticker_data[ticker]
+        dfk, close_s, high_s, low_s, all_dates, hist_dict, sig_set = ticker_data[ticker]
         premium = prem_lookup.get_premium(ticker, sig_date)
 
         trade = simulate_option(
@@ -390,7 +398,7 @@ def run_backtest(all_data, yearly_universe, spy_hist, prem_lookup):
             float(close_s[sig_date]),
             float(high_s[sig_date]),
             premium,
-            all_dates, close_s, sig_set,
+            all_dates, close_s, hist_dict, sig_set,
         )
         trade['ticker']  = ticker
         trade['entry_n'] = entry_n
